@@ -1,6 +1,8 @@
 import { GoogleGenAI } from "@google/genai";
 import { NextRequest, NextResponse } from "next/server";
 
+export const dynamic = "force-dynamic";
+
 const SYSTEM_PROMPT = `You are a Beagle named Scooby. I am providing you with acoustic telemetry from my bark (Pitch, Volume, Cadence). Translate this data into a fun, first-person US English phrase based on this logic:
 - Drawn-out howl/baying = 'I smell something incredible! I am on the trail!'
 - High pitch, high volume, rapid cadence = 'Hey! Look! Someone is here! Pay attention to this right now!'
@@ -15,29 +17,21 @@ Respond with ONLY the translated phrase (1-2 sentences max). Do not add any JSON
 function classifyMood(cadence: string, pitchLabel: string, volumeLabel: string): string {
   const cadenceLower = cadence.toLowerCase();
 
-  if (cadenceLower.includes("howl") || cadenceLower.includes("drawn"))
-    return "tracking";
-  if (pitchLabel === "High" && volumeLabel === "Loud" && cadenceLower.includes("rapid"))
-    return "alert";
-  if (cadenceLower.includes("single") || cadenceLower.includes("sharp"))
-    return "startled";
-  if (pitchLabel === "Low" && cadenceLower.includes("slow"))
-    return "warning";
-  if (cadenceLower.includes("monotonous") || cadenceLower.includes("long pause"))
-    return "lonely";
-  // Expanded mood detection for more bark types
-  if (pitchLabel === "High" && volumeLabel === "Quiet")
-    return "happy";
-  if (pitchLabel === "High" && cadenceLower.includes("rapid"))
-    return "alert";
-  if (pitchLabel === "Mid" && cadenceLower.includes("slow"))
-    return "lonely";
-  if (pitchLabel === "Low" && volumeLabel === "Loud")
-    return "warning";
-  if (pitchLabel === "High")
-    return "excited";
-  if (cadenceLower.includes("whine"))
-    return "happy";
+  // 1. Cadence-first detection
+  if (cadenceLower.includes("howl") || cadenceLower.includes("drawn")) return "tracking";
+  if (cadenceLower.includes("rapid")) return "alert";
+  if (cadenceLower.includes("slow") || cadenceLower.includes("monotonous") || cadenceLower.includes("long pause")) {
+    return pitchLabel === "High" ? "lonely" : "warning";
+  }
+  if (cadenceLower.includes("single") || cadenceLower.includes("sharp")) return "startled";
+  if (cadenceLower.includes("whine")) return "happy";
+
+  // 2. Pitch/Volume secondary detection
+  if (pitchLabel === "High") {
+    return volumeLabel === "Quiet" ? "happy" : "excited";
+  }
+  if (pitchLabel === "Low" && volumeLabel === "Loud") return "warning";
+  if (pitchLabel === "Mid" && volumeLabel === "Quiet") return "curious";
 
   return "curious";
 }

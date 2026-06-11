@@ -33,6 +33,7 @@ export default function Home() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(metrics),
+          cache: "no-store",
         });
 
         // The API always returns valid JSON with a translation, even on errors
