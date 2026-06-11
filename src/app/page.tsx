@@ -35,15 +35,12 @@ export default function Home() {
           body: JSON.stringify(metrics),
         });
 
-        if (!response.ok) {
-          throw new Error("Translation failed");
-        }
-
+        // The API always returns valid JSON with a translation, even on errors
         const data = await response.json();
 
         const newTranslation: Translation = {
           id: crypto.randomUUID(),
-          text: data.translation,
+          text: data.translation || data.error || "Woof!",
           metrics,
           timestamp: new Date(),
           mood: data.mood || "curious",
@@ -51,14 +48,19 @@ export default function Home() {
 
         setTranslations((prev) => [...prev, newTranslation]);
       } catch (err) {
-        console.error("Translation error:", err);
-        // Still add a fallback translation
+        // Network error — complete failure to reach the API
+        console.error("Network error:", err);
+        const fallbacks = [
+          "WOOF! My translator is napping but I have LOTS to say! Try again!",
+          "Bark bark! (Network hiccup — but my enthusiasm is uninterrupted!)",
+          "Aroooo! The internet gremlins ate my translation. One more try?",
+        ];
         const newTranslation: Translation = {
           id: crypto.randomUUID(),
-          text: "Woof! (Something went wrong with the translation, but I still love you!)",
+          text: fallbacks[Math.floor(Math.random() * fallbacks.length)],
           metrics,
           timestamp: new Date(),
-          mood: "happy",
+          mood: "curious",
         };
         setTranslations((prev) => [...prev, newTranslation]);
       } finally {
