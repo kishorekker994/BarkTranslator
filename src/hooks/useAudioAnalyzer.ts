@@ -3,14 +3,15 @@
 import { useCallback, useRef, useState } from "react";
 
 export interface BarkMetrics {
-  pitch: number;         // Hz - average frequency
+  pitch: number;         // Hz - weighted average frequency
   pitchLabel: string;    // "Low" | "Mid" | "High"
   volume: number;        // dB level
   volumeLabel: string;   // "Quiet" | "Moderate" | "Loud"
   cadence: string;       // descriptive cadence
-  barkCount: number;     // number of detected barks
-  avgDuration: number;   // average bark duration in ms
-  avgPause: number;      // average pause between barks in ms
+  barkCount: number;     // number of detected vocalizations
+  avgDuration: number;   // average vocalization duration in ms
+  avgPause: number;      // average pause between vocalizations in ms
+  recordingDuration: number; // total recording length in ms
 }
 
 interface UseAudioAnalyzerReturn {
@@ -20,53 +21,53 @@ interface UseAudioAnalyzerReturn {
   stopListening: () => BarkMetrics | null;
   frequencyData: Uint8Array;
   currentVolume: number;
+  elapsedSeconds: number;
   error: string | null;
 }
 
-const BARK_THRESHOLD_DB = -35;  // dB threshold for bark detection
-const BARK_END_SILENCE_MS = 200; // ms of silence to end a bark
+// ─── Beagle-tuned constants ───────────────────────────────────────────────────
+// Beagles typically vocalize at -28 to -20 dB in a living room setting.
+// Slightly lower threshold than generic so we catch soft whines too.
+const BARK_THRESHOLD_DB = -38;
+const BARK_END_SILENCE_MS = 180; // ms of silence before a bark is "closed"
 const SAMPLE_RATE = 44100;
 const FFT_SIZE = 2048;
 
+// Beagles: bark range 200–2800 Hz; bay/howl 150–900 Hz
+const MIN_FREQ_HZ = 150;
+const MAX_FREQ_HZ = 2800;
+
+// ─── Pitch classifier — beagle-specific ranges ────────────────────────────────
 function classifyPitch(hz: number): string {
-  if (hz < 300) return "Low";
-  if (hz < 800) return "Mid";
-  return "High";
+  if (hz < 350) return "Low";   // bay / howl / growl
+  if (hz < 900) return "Mid";   // typical bark
+  return "High";                // yelp / whine / alert
 }
 
 function classifyVolume(db: number): string {
-  if (db < -30) return "Quiet";
-  if (db < -15) return "Moderate";
+  if (db < -32) return "Quiet";
+  if (db < -18) return "Moderate";
   return "Loud";
 }
 
+// ─── Cadence classifier ───────────────────────────────────────────────────────
 function classifyCadence(
   barkCount: number,
   avgDuration: number,
   avgPause: number,
   totalDuration: number
 ): string {
-  const barksPerSecond = barkCount / (totalDuration / 1000);
+  const barksPerSecond = barkCount / Math.max(totalDuration / 1000, 0.5);
 
-  // Single bark
+  if (barkCount === 0) return "Whine/sustained sound";
   if (barkCount === 1) {
-    if (avgDuration > 1500) return "Drawn-out howl/baying";
+    if (avgDuration > 1200) return "Drawn-out howl/baying";
     return "Single, sharp bark";
   }
-
-  // Drawn-out sustained sound
-  if (avgDuration > 1500) return "Drawn-out howl/baying";
-
-  // Rapid cadence
-  if (barksPerSecond > 3 || avgPause < 200) return "Rapid cadence";
-
-  // Slow cadence
-  if (barksPerSecond < 1 || avgPause > 2000) return "Slow cadence";
-
-  // Monotonous with long pauses
-  if (avgPause > 1000 && barksPerSecond < 2)
-    return "Monotonous with long pauses";
-
+  if (avgDuration > 1200) return "Drawn-out howl/baying";
+  if (barksPerSecond > 3.5 || avgPause < 180) return "Rapid cadence";
+  if (barksPerSecond < 0.8 || avgPause > 2200) return "Slow cadence";
+  if (avgPause > 1200 && barksPerSecond < 1.8) return "Monotonous with long pauses";
   return "Moderate cadence";
 }
 
@@ -77,26 +78,28 @@ export function useAudioAnalyzer(): UseAudioAnalyzerReturn {
     new Uint8Array(FFT_SIZE / 2)
   );
   const [currentVolume, setCurrentVolume] = useState(-60);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animFrameRef = useRef<number>(0);
+  const timerIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Bark detection state
-  const barkStartTimesRef = useRef<number[]>([]);
   const barkDurationsRef = useRef<number[]>([]);
   const pauseDurationsRef = useRef<number[]>([]);
   const isInBarkRef = useRef(false);
   const barkStartRef = useRef(0);
-  const barkEndRef = useRef(0);
   const lastBarkEndRef = useRef(0);
   const silenceStartRef = useRef(0);
   const recordingStartRef = useRef(0);
 
-  // Accumulated frequency data for averaging
+  // Pitch sampling
   const pitchSamplesRef = useRef<number[]>([]);
+  // Volume tracking (peak dB during recording)
+  const peakVolumeRef = useRef(-60);
 
   const computeRmsDb = useCallback((timeDomainData: Uint8Array): number => {
     let sumSquares = 0;
@@ -105,23 +108,22 @@ export function useAudioAnalyzer(): UseAudioAnalyzerReturn {
       sumSquares += normalized * normalized;
     }
     const rms = Math.sqrt(sumSquares / timeDomainData.length);
-    const db = 20 * Math.log10(Math.max(rms, 1e-10));
-    return db;
+    return 20 * Math.log10(Math.max(rms, 1e-10));
   }, []);
 
+  // Weighted centroid limited to beagle vocalization range
   const computeWeightedFrequency = useCallback(
     (freqData: Uint8Array, sampleRate: number, fftSize: number): number => {
       let weightedSum = 0;
       let totalMagnitude = 0;
-      const binFrequencyStep = sampleRate / fftSize;
+      const binStep = sampleRate / fftSize;
 
       for (let i = 1; i < freqData.length; i++) {
-        const magnitude = freqData[i];
-        const frequency = i * binFrequencyStep;
-        // Focus on dog bark range (100Hz - 3000Hz)
-        if (frequency >= 100 && frequency <= 3000) {
-          weightedSum += frequency * magnitude;
-          totalMagnitude += magnitude;
+        const freq = i * binStep;
+        if (freq >= MIN_FREQ_HZ && freq <= MAX_FREQ_HZ) {
+          const mag = freqData[i];
+          weightedSum += freq * mag;
+          totalMagnitude += mag;
         }
       }
 
@@ -132,13 +134,14 @@ export function useAudioAnalyzer(): UseAudioAnalyzerReturn {
 
   const startListening = useCallback(async () => {
     setError(null);
+    setElapsedSeconds(0);
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
+          noiseSuppression: false, // keep raw for beagle analysis
+          autoGainControl: false,  // don't compress — we need real volume data
         },
       });
 
@@ -146,24 +149,30 @@ export function useAudioAnalyzer(): UseAudioAnalyzerReturn {
       const source = audioContext.createMediaStreamSource(stream);
       const analyser = audioContext.createAnalyser();
       analyser.fftSize = FFT_SIZE;
-      analyser.smoothingTimeConstant = 0.8;
+      analyser.smoothingTimeConstant = 0.75;
       source.connect(analyser);
 
       audioContextRef.current = audioContext;
       analyserRef.current = analyser;
       streamRef.current = stream;
 
-      // Reset bark detection
-      barkStartTimesRef.current = [];
+      // Reset all tracking
       barkDurationsRef.current = [];
       pauseDurationsRef.current = [];
       isInBarkRef.current = false;
       pitchSamplesRef.current = [];
+      peakVolumeRef.current = -60;
+      lastBarkEndRef.current = 0;
+      silenceStartRef.current = 0;
       recordingStartRef.current = Date.now();
 
       setIsListening(true);
 
-      // Start the analysis loop
+      // Elapsed-seconds timer
+      timerIntervalRef.current = setInterval(() => {
+        setElapsedSeconds(Math.floor((Date.now() - recordingStartRef.current) / 1000));
+      }, 1000);
+
       const freqDataArray = new Uint8Array(analyser.frequencyBinCount);
       const timeDomainArray = new Uint8Array(analyser.fftSize);
 
@@ -173,34 +182,25 @@ export function useAudioAnalyzer(): UseAudioAnalyzerReturn {
         analyserRef.current.getByteFrequencyData(freqDataArray);
         analyserRef.current.getByteTimeDomainData(timeDomainArray);
 
-        // Update frequency data for visualizer
-        const freqCopy = new Uint8Array(freqDataArray);
-        setFrequencyData(freqCopy);
+        setFrequencyData(new Uint8Array(freqDataArray));
 
-        // Compute volume
         const db = computeRmsDb(timeDomainArray);
         setCurrentVolume(db);
+        if (db > peakVolumeRef.current) peakVolumeRef.current = db;
 
-        // Compute pitch
         const pitch = computeWeightedFrequency(
           freqDataArray,
           audioContext.sampleRate,
           analyser.fftSize
         );
-        if (pitch > 0) {
-          pitchSamplesRef.current.push(pitch);
-        }
+        if (pitch > 0) pitchSamplesRef.current.push(pitch);
 
-        // Bark detection
+        // Bark / vocalization detection
         const now = Date.now();
         if (db > BARK_THRESHOLD_DB) {
           if (!isInBarkRef.current) {
-            // Bark started
             isInBarkRef.current = true;
             barkStartRef.current = now;
-            barkStartTimesRef.current.push(now);
-
-            // Record pause if there was a previous bark
             if (lastBarkEndRef.current > 0) {
               pauseDurationsRef.current.push(now - lastBarkEndRef.current);
             }
@@ -211,9 +211,7 @@ export function useAudioAnalyzer(): UseAudioAnalyzerReturn {
             if (silenceStartRef.current === 0) {
               silenceStartRef.current = now;
             } else if (now - silenceStartRef.current > BARK_END_SILENCE_MS) {
-              // Bark ended
               isInBarkRef.current = false;
-              barkEndRef.current = now;
               lastBarkEndRef.current = now;
               barkDurationsRef.current.push(now - barkStartRef.current);
               silenceStartRef.current = 0;
@@ -236,13 +234,16 @@ export function useAudioAnalyzer(): UseAudioAnalyzerReturn {
   const stopListening = useCallback((): BarkMetrics | null => {
     cancelAnimationFrame(animFrameRef.current);
 
-    // Stop all tracks
+    if (timerIntervalRef.current) {
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = null;
+    }
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
 
-    // Close audio context
     if (audioContextRef.current) {
       audioContextRef.current.close();
       audioContextRef.current = null;
@@ -253,19 +254,18 @@ export function useAudioAnalyzer(): UseAudioAnalyzerReturn {
     setIsProcessing(true);
 
     const totalDuration = Date.now() - recordingStartRef.current;
-    const barkCount = barkDurationsRef.current.length;
 
-    // If currently in a bark, close it
+    // Close any in-progress bark
     if (isInBarkRef.current) {
       barkDurationsRef.current.push(Date.now() - barkStartRef.current);
       isInBarkRef.current = false;
     }
 
-    // Calculate averages
+    const barkCount = barkDurationsRef.current.length;
+
     const avgDuration =
-      barkDurationsRef.current.length > 0
-        ? barkDurationsRef.current.reduce((a, b) => a + b, 0) /
-          barkDurationsRef.current.length
+      barkCount > 0
+        ? barkDurationsRef.current.reduce((a, b) => a + b, 0) / barkCount
         : 0;
 
     const avgPause =
@@ -280,34 +280,25 @@ export function useAudioAnalyzer(): UseAudioAnalyzerReturn {
           pitchSamplesRef.current.length
         : 0;
 
-    // If no barks detected but there was audio, create a "whine" detection
     const finalBarkCount = barkCount > 0 ? barkCount : 1;
     const finalAvgDuration = avgDuration > 0 ? avgDuration : totalDuration;
 
     const pitch = Math.round(avgPitch);
-    const pitchLabel = classifyPitch(pitch);
-    const volumeLabel = classifyVolume(currentVolume);
-    const cadence = classifyCadence(
-      finalBarkCount,
-      finalAvgDuration,
-      avgPause,
-      totalDuration
-    );
-
     const metrics: BarkMetrics = {
       pitch,
-      pitchLabel,
-      volume: Math.round(currentVolume),
-      volumeLabel,
-      cadence,
+      pitchLabel: classifyPitch(pitch),
+      volume: Math.round(peakVolumeRef.current), // use peak, not last sample
+      volumeLabel: classifyVolume(peakVolumeRef.current),
+      cadence: classifyCadence(finalBarkCount, finalAvgDuration, avgPause, totalDuration),
       barkCount: finalBarkCount,
       avgDuration: Math.round(finalAvgDuration),
       avgPause: Math.round(avgPause),
+      recordingDuration: totalDuration,
     };
 
     setIsProcessing(false);
     return metrics;
-  }, [currentVolume]);
+  }, []);
 
   return {
     isListening,
@@ -316,6 +307,7 @@ export function useAudioAnalyzer(): UseAudioAnalyzerReturn {
     stopListening,
     frequencyData,
     currentVolume,
+    elapsedSeconds,
     error,
   };
 }

@@ -51,6 +51,7 @@
   --color-outline-variant: var(--outline-variant);
   --color-error: var(--error);
   --color-on-surface-variant: var(--on-surface-variant);
+  --color-surface-highest: var(--surface-container-highest);
   --font-outfit: var(--font-outfit);
   --font-inter: var(--font-inter);
 }
@@ -187,4 +188,24 @@ body {
 .glass {
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
+}
+
+/* === Metric Pill === */
+.metric-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: 500;
+  font-family: var(--font-inter), system-ui, sans-serif;
+  background: rgba(100, 66, 26, 0.20);
+  color: var(--secondary);
+  border: 1px solid rgba(100, 66, 26, 0.25);
+  gap: 3px;
+}
+
+/* === Confidence Bar Surface === */
+.surface-highest {
+  background: var(--surface-container-highest);
 }
